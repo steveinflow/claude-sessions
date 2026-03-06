@@ -61,6 +61,7 @@ claude-sessions -s "deploy"
 | `/` | Search / filter |
 | `g` / `G` | Jump to top / bottom |
 | `Tab` | Focus right pane |
+| `Shift+Tab` | Refocus left (list) pane |
 | `Ctrl-b p` | Toggle picker visibility |
 | `Esc` / `q` | Back / quit |
 
