@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Claude Code Session Manager - terminal TUI for browsing session history."""
+
+import json
+import os
+import sys
+import curses
+import re
+import subprocess
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+NAMES_FILE = CLAUDE_DIR / "session-names.json"
+TMUX_SESSION = "claude-sessions"
+TMUX_RIGHT_PANE = "claude-sessions:0.1"
+
+
+def load_names():
+    """Load custom session names from disk."""
+    if NAMES_FILE.exists():
+        try:
+            with open(NAMES_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_names(names):
+    """Persist custom session names to disk."""
+    with open(NAMES_FILE, "w") as f:
+        json.dump(names, f, indent=2)
+
+
+def load_sessions():
+    """Parse history.jsonl and group prompts by session."""
+    sessions = {}
+    with open(HISTORY_FILE) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sid = d.get("sessionId", "")
+            proj = d.get("project", "")
+            ts = d.get("timestamp", 0)
+            display = d.get("display", "").strip()
+            if not sid or not display:
+                continue
+            if display.startswith("/"):
+                if not any(display.startswith(p) for p in ["/help", "/?"]):
+                    words = display.split()
+                    if len(words) == 1:
+                        continue
+            if sid not in sessions:
+                sessions[sid] = {
+                    "id": sid,
+                    "project": proj,
+                    "first_ts": ts,
+                    "last_ts": ts,
+                    "prompts": [],
+                }
+            sessions[sid]["last_ts"] = max(sessions[sid]["last_ts"], ts)
+            sessions[sid]["first_ts"] = min(sessions[sid]["first_ts"], ts)
+            sessions[sid]["prompts"].append({"text": display, "ts": ts})
+
+    result = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
+    names = load_names()
+    for s in result:
+        if s["id"] in names:
+            s["summary"] = names[s["id"]]
+            s["has_custom_name"] = True
+        else:
+            s["summary"] = summarize_session(s)
+            s["has_custom_name"] = False
+    return result
+
+
+def find_conversation_file(session):
+    """Locate the .jsonl conversation file for a session."""
+    sid = session["id"]
+    proj = session["project"]
+    dir_name = proj.replace("/", "-")
+    proj_dir = PROJECTS_DIR / dir_name
+    candidate = proj_dir / f"{sid}.jsonl"
+    if candidate.exists():
+        return candidate
+    for d in PROJECTS_DIR.iterdir():
+        c = d / f"{sid}.jsonl"
+        if c.exists():
+            return c
+    return None
+
+
+def load_conversation(session):
+    """Load full conversation from the session's JSONL file."""
+    path = find_conversation_file(session)
+    if not path:
+        return None
+    messages = []
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = d.get("message", {})
+            role = msg.get("role")
+            content = msg.get("content")
+            if not role or not content:
+                continue
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block["text"])
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts)
+            if not content.strip():
+                continue
+            ts = d.get("timestamp", "")
+            messages.append({"role": role, "content": content.strip(), "ts": ts})
+    return messages
+
+
+def format_ts(ts_ms):
+    """Format millisecond timestamp to readable string."""
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000)
+        now = datetime.now()
+        if dt.date() == now.date():
+            return dt.strftime("Today %H:%M")
+        diff = (now - dt).days
+        if diff == 1:
+            return dt.strftime("Yesterday %H:%M")
+        if diff < 7:
+            return dt.strftime("%A %H:%M")
+        return dt.strftime("%b %d, %Y")
+    except (ValueError, OSError):
+        return "Unknown"
+
+
+def short_project(proj):
+    """Shorten project path for display."""
+    home = str(Path.home())
+    if proj.startswith(home):
+        return "~" + proj[len(home):]
+    return proj
+
+
+def summarize_session(session):
+    """Generate a short description (a few words) from session prompts."""
+    prompts = [p["text"] for p in session["prompts"]]
+    if not prompts:
+        return "empty session"
+
+    first = prompts[0].strip()
+    first = re.sub(r"\[Pasted text #\d+[^\]]*\]", "", first).strip()
+    first = re.sub(r"^[#*>-]+\s*", "", first)
+    first = re.sub(r"`[^`]+`", "", first).strip()
+    first = re.sub(r"\s+", " ", first).strip()
+
+    for delim in [". ", ".\n", "\n", ", and ", "; ", " - "]:
+        idx = first.find(delim)
+        if 5 < idx < 60:
+            first = first[:idx]
+            break
+    colon_idx = first.find(": ")
+    if 15 < colon_idx < 60:
+        first = first[:colon_idx]
+
+    words = first.split()
+    if not words:
+        for p in prompts[1:]:
+            w = p.strip().split()
+            if w:
+                words = w
+                break
+    if not words:
+        return "empty session"
+
+    desc = " ".join(words[:6])
+    desc = desc.rstrip(".,;:-(")
+    if len(desc) > 1 and not desc[:2].isupper():
+        desc = desc[0].lower() + desc[1:]
+    return desc
+
+
+def wrap_text(text, width):
+    """Wrap text to fit within width."""
+    lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            lines.append("")
+            continue
+        while len(paragraph) > width:
+            break_at = paragraph.rfind(" ", 0, width)
+            if break_at == -1:
+                break_at = width
+            lines.append(paragraph[:break_at])
+            paragraph = paragraph[break_at:].lstrip()
+        lines.append(paragraph)
+    return lines
+
+
+def strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+# ─── tmux helpers ───
+
+def in_tmux():
+    return os.environ.get("TMUX", "") != ""
+
+
+def in_our_tmux():
+    """Check if we're running inside the claude-sessions tmux session."""
+    return os.environ.get("CLAUDE_SESSIONS_PANE") == "1"
+
+
+def tmux_send(pane, cmd):
+    """Send keys to a tmux pane. Interrupts any running process first."""
+    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c", ""], check=False)
+    subprocess.run(["tmux", "send-keys", "-t", pane, cmd, "Enter"], check=False)
+
+
+def tmux_launch():
+    """Create the tmux split layout and launch the TUI in the left pane."""
+    script = os.path.abspath(__file__)
+
+    # Kill existing session if any
+    subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION], check=False,
+                    capture_output=True)
+
+    # Create new session with the picker in the left pane
+    subprocess.run([
+        "tmux", "new-session", "-d",
+        "-s", TMUX_SESSION,
+        "-x", "200", "-y", "50",
+        "-e", "CLAUDE_SESSIONS_PANE=1",
+        f"python3 {script} --picker",
+    ], check=True)
+
+    # Split right pane (60% width)
+    subprocess.run([
+        "tmux", "split-window", "-h",
+        "-t", f"{TMUX_SESSION}:0",
+        "-l", "60%",
+    ], check=True)
+
+    # Send a welcome message to the right pane
+    subprocess.run([
+        "tmux", "send-keys", "-t", TMUX_RIGHT_PANE,
+        "echo '  Select a session from the left pane and press Enter to load it here.'", "Enter",
+    ], check=False)
+
+    # Bind Ctrl-b p to toggle the picker pane
+    # The command breaks/joins pane 0 to hide/show the picker
+    toggle_cmd = (
+        "if [ \"$(tmux list-panes -t claude-sessions:0 | wc -l | tr -d ' ')\" = \"1\" ]; then "
+        "tmux join-pane -hb -t claude-sessions:0 -s claude-sessions:picker -l 40%; "
+        "else "
+        "tmux break-pane -d -t claude-sessions:0.0 -n picker; "
+        "fi"
+    )
+    subprocess.run([
+        "tmux", "bind-key", "-T", "prefix", "p",
+        "run-shell", toggle_cmd,
+    ], check=False)
+
+    # Focus back on the left pane (picker)
+    subprocess.run(["tmux", "select-pane", "-t", f"{TMUX_SESSION}:0.0"], check=False)
+
+    # Attach
+    os.execvp("tmux", ["tmux", "attach-session", "-t", TMUX_SESSION])
+
+
+# ─── TUI with curses ───
+
+class SessionManager:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.sessions = load_sessions()
+        self.filtered = self.sessions[:]
+        self.cursor = 0
+        self.scroll = 0
+        self.search = ""
+        self.searching = False
+        self.mode = "list"  # list | detail | conversation
+        self.renaming = False
+        self.rename_buf = ""
+        self.detail_scroll = 0
+        self.conv_messages = []
+        self.conv_scroll = 0
+        self.conv_lines = []
+        self.selected_session = None
+        self.status_msg = ""
+
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)     # header
+        curses.init_pair(2, curses.COLOR_GREEN, -1)     # project
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)    # timestamp
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)  # selected
+        curses.init_pair(5, curses.COLOR_WHITE, -1)     # normal
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # role label
+        curses.init_pair(7, curses.COLOR_RED, -1)       # search
+        curses.init_pair(8, 8, -1)                      # dim/gray
+        curses.init_pair(9, curses.COLOR_GREEN, -1)     # status
+
+        curses.curs_set(0)
+        self.stdscr.keypad(True)
+
+    def apply_filter(self):
+        if not self.search:
+            self.filtered = self.sessions[:]
+        else:
+            q = self.search.lower()
+            self.filtered = [
+                s for s in self.sessions
+                if q in s["project"].lower()
+                or q in s.get("summary", "").lower()
+                or any(q in p["text"].lower() for p in s["prompts"])
+            ]
+        self.cursor = 0
+        self.scroll = 0
+
+    def launch_in_pane(self, session):
+        """Send claude resume command to the right tmux pane."""
+        sid = session["id"]
+        project = session["project"]
+        tmux_send(TMUX_RIGHT_PANE, f"cd {project} && claude --resume {sid} --dangerously-skip-permissions")
+        self.status_msg = f"Resumed: {session.get('summary', sid[:8])}"
+
+    def launch_new_in_pane(self):
+        """Send new claude session command to the right tmux pane."""
+        tmux_send(TMUX_RIGHT_PANE, "claude --dangerously-skip-permissions")
+        self.status_msg = "Started new session"
+
+    def launch_fullscreen(self, session):
+        """Open session in a new full tmux window."""
+        sid = session["id"]
+        project = session["project"]
+        subprocess.run([
+            "tmux", "new-window", "-t", TMUX_SESSION,
+            "-n", session.get("summary", sid[:8])[:20],
+            f"cd {project} && claude --resume {sid} --dangerously-skip-permissions",
+        ], check=False)
+        self.status_msg = f"Opened fullscreen: {session.get('summary', sid[:8])}"
+
+    def draw_list(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+
+        # Header
+        header = " Claude Code Sessions "
+        count = f" {len(self.filtered)}/{len(self.sessions)} sessions "
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addnstr(0, 0, "─" * w, w - 1)
+        cx = (w - len(header)) // 2
+        if cx > 0:
+            self.stdscr.addnstr(0, cx, header, w - cx - 1)
+        self.stdscr.addnstr(0, w - len(count) - 2, count, len(count))
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        # Search / rename / status bar
+        if self.renaming:
+            label = " rename: "
+            self.stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+            self.stdscr.addnstr(1, 0, label, w - 1)
+            self.stdscr.addnstr(1, len(label), self.rename_buf + "▌", w - len(label) - 1)
+            self.stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+        elif self.searching or self.search:
+            search_label = " / search: " if self.searching else " /search "
+            self.stdscr.attron(curses.color_pair(7))
+            self.stdscr.addnstr(1, 0, search_label, w - 1)
+            self.stdscr.addnstr(1, len(search_label), self.search + ("▌" if self.searching else ""), w - len(search_label) - 1)
+            self.stdscr.attroff(curses.color_pair(7))
+        elif self.status_msg:
+            self.stdscr.addnstr(1, 1, f"▸ {self.status_msg}", w - 2, curses.color_pair(9) | curses.A_BOLD)
+        else:
+            self.stdscr.addnstr(1, 1, "/search", w - 2, curses.color_pair(8))
+
+        # Session list
+        list_start = 2
+        visible = h - list_start - 2
+        rows_per_session = 3
+
+        max_visible = visible // rows_per_session
+        if max_visible < 1:
+            max_visible = 1
+
+        if self.cursor < self.scroll:
+            self.scroll = self.cursor
+        if self.cursor >= self.scroll + max_visible:
+            self.scroll = self.cursor - max_visible + 1
+
+        for i in range(max_visible):
+            idx = self.scroll + i
+            if idx >= len(self.filtered):
+                break
+            s = self.filtered[idx]
+            y = list_start + i * rows_per_session
+            if y + 2 >= h - 1:
+                break
+
+            selected = idx == self.cursor
+            if selected:
+                attr = curses.color_pair(4) | curses.A_BOLD
+                self.stdscr.attron(attr)
+                for row in range(rows_per_session):
+                    if y + row < h - 1:
+                        self.stdscr.addnstr(y + row, 0, " " * (w - 1), w - 1, attr)
+                self.stdscr.attroff(attr)
+
+            proj = short_project(s["project"])
+            time_str = format_ts(s["last_ts"])
+            n_prompts = f"({len(s['prompts'])} prompts)"
+
+            if selected:
+                self.stdscr.addnstr(y, 1, "▸ ", 3, curses.color_pair(4) | curses.A_BOLD)
+                self.stdscr.addnstr(y, 3, proj, w - 4, curses.color_pair(4) | curses.A_BOLD)
+                right = f"{n_prompts}  {time_str}"
+                rx = w - len(right) - 2
+                if rx > len(proj) + 4:
+                    self.stdscr.addnstr(y, rx, right, len(right), curses.color_pair(4))
+            else:
+                self.stdscr.addnstr(y, 1, "  ", 3)
+                self.stdscr.addnstr(y, 3, proj, w - 4, curses.color_pair(2) | curses.A_BOLD)
+                right = f"{n_prompts}  {time_str}"
+                rx = w - len(right) - 2
+                if rx > len(proj) + 4:
+                    self.stdscr.addnstr(y, rx, n_prompts + "  ", len(n_prompts) + 2, curses.color_pair(8))
+                    self.stdscr.addnstr(y, rx + len(n_prompts) + 2, time_str, len(time_str), curses.color_pair(3))
+
+            desc = s.get("summary", "")
+            if desc:
+                if selected:
+                    self.stdscr.addnstr(y + 1, 5, desc, w - 6, curses.color_pair(4))
+                else:
+                    self.stdscr.addnstr(y + 1, 5, desc, w - 6, curses.color_pair(5))
+
+            if not selected and y + 2 < h - 1:
+                self.stdscr.addnstr(y + 2, 1, "─" * (w - 2), w - 2, curses.color_pair(8))
+
+        # Footer
+        footer = " Enter open  o fullscreen  n new  r rename  v view  c conv  / search  q quit "
+        self.stdscr.attron(curses.color_pair(1))
+        self.stdscr.addnstr(h - 1, 0, "─" * w, w - 1)
+        fx = (w - len(footer)) // 2
+        if fx > 0:
+            self.stdscr.addnstr(h - 1, fx, footer, w - fx - 1)
+        self.stdscr.attroff(curses.color_pair(1))
+
+        self.stdscr.refresh()
+
+    def draw_detail(self):
+        """Show all prompts from a session."""
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        s = self.selected_session
+
+        proj = short_project(s["project"])
+        time_range = f"{format_ts(s['first_ts'])} → {format_ts(s['last_ts'])}"
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addnstr(0, 0, "─" * w, w - 1)
+        title = f" {proj} "
+        self.stdscr.addnstr(0, 2, title, w - 4)
+        self.stdscr.addnstr(0, w - len(time_range) - 2, time_range, len(time_range))
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        sid_line = f"Session: {s['id']}"
+        self.stdscr.addnstr(1, 2, sid_line, w - 4, curses.color_pair(8))
+
+        start_y = 3
+        visible = h - start_y - 2
+        prompts = s["prompts"]
+        max_scroll = max(0, len(prompts) - visible)
+        self.detail_scroll = max(0, min(self.detail_scroll, max_scroll))
+
+        for i in range(visible):
+            idx = self.detail_scroll + i
+            if idx >= len(prompts):
+                break
+            y = start_y + i
+            p = prompts[idx]
+            ts = format_ts(p["ts"])
+            num = f"{idx + 1:3d}. "
+
+            self.stdscr.addnstr(y, 1, num, 5, curses.color_pair(8))
+            max_prompt_w = w - len(ts) - 10
+            text = p["text"][:max_prompt_w] if max_prompt_w > 0 else ""
+            self.stdscr.addnstr(y, 6, text, max(0, w - len(ts) - 8), curses.color_pair(5))
+            self.stdscr.addnstr(y, w - len(ts) - 2, ts, len(ts), curses.color_pair(3))
+
+        footer = " Enter open  o fullscreen  ↑↓ scroll  c conv  Esc/q back "
+        self.stdscr.attron(curses.color_pair(1))
+        self.stdscr.addnstr(h - 1, 0, "─" * w, w - 1)
+        fx = (w - len(footer)) // 2
+        if fx > 0:
+            self.stdscr.addnstr(h - 1, fx, footer, w - fx - 1)
+        self.stdscr.attroff(curses.color_pair(1))
+
+        self.stdscr.refresh()
+
+    def prepare_conv_lines(self, w):
+        """Pre-render conversation lines for scrolling."""
+        self.conv_lines = []
+        if not self.conv_messages:
+            self.conv_lines.append(("No conversation file found for this session.", curses.color_pair(7)))
+            return
+
+        content_w = w - 4
+        for msg in self.conv_messages:
+            role = msg["role"]
+            ts = msg.get("ts", "")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    ts_str = dt.strftime(" %H:%M:%S")
+                except (ValueError, AttributeError):
+                    ts_str = ""
+            else:
+                ts_str = ""
+
+            if role == "user":
+                label = f"You{ts_str}"
+                color = curses.color_pair(2) | curses.A_BOLD
+            else:
+                label = f"Claude{ts_str}"
+                color = curses.color_pair(6) | curses.A_BOLD
+
+            self.conv_lines.append((label, color))
+            wrapped = wrap_text(msg["content"], content_w)
+            text_color = curses.color_pair(5)
+            for wl in wrapped[:200]:
+                self.conv_lines.append(("  " + wl, text_color))
+            if len(wrapped) > 200:
+                self.conv_lines.append(("  ... (truncated)", curses.color_pair(8)))
+            self.conv_lines.append(("", 0))
+
+    def draw_conversation(self):
+        h, w = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        s = self.selected_session
+
+        proj = short_project(s["project"])
+        self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addnstr(0, 0, "─" * w, w - 1)
+        title = f" Conversation: {proj} "
+        self.stdscr.addnstr(0, 2, title, w - 4)
+        self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        start_y = 1
+        visible = h - start_y - 2
+        total = len(self.conv_lines)
+        max_scroll = max(0, total - visible)
+        self.conv_scroll = max(0, min(self.conv_scroll, max_scroll))
+
+        for i in range(visible):
+            li = self.conv_scroll + i
+            if li >= total:
+                break
+            y = start_y + i
+            text, attr = self.conv_lines[li]
+            try:
+                self.stdscr.addnstr(y, 1, text[:w - 2], w - 2, attr)
+            except curses.error:
+                pass
+
+        if total > visible:
+            pct = int((self.conv_scroll / max_scroll) * 100) if max_scroll else 0
+            indicator = f" {pct}% ({self.conv_scroll + 1}-{min(self.conv_scroll + visible, total)}/{total}) "
+            self.stdscr.addnstr(0, w - len(indicator) - 2, indicator, len(indicator), curses.color_pair(3))
+
+        footer = " ↑↓/PgUp/PgDn scroll  Esc/q back "
+        self.stdscr.attron(curses.color_pair(1))
+        self.stdscr.addnstr(h - 1, 0, "─" * w, w - 1)
+        fx = (w - len(footer)) // 2
+        if fx > 0:
+            self.stdscr.addnstr(h - 1, fx, footer, w - fx - 1)
+        self.stdscr.attroff(curses.color_pair(1))
+
+        self.stdscr.refresh()
+
+    def open_conversation(self):
+        s = self.selected_session
+        self.conv_messages = load_conversation(s) or []
+        h, w = self.stdscr.getmaxyx()
+        self.prepare_conv_lines(w)
+        self.conv_scroll = 0
+        self.mode = "conversation"
+
+    def run(self):
+        while True:
+            if self.mode == "list":
+                self.draw_list()
+                ch = self.stdscr.getch()
+                self.status_msg = ""
+
+                if self.renaming:
+                    if ch == 27:  # Esc
+                        self.renaming = False
+                        self.rename_buf = ""
+                    elif ch in (10, 13):  # Enter - save
+                        if self.filtered:
+                            s = self.filtered[self.cursor]
+                            names = load_names()
+                            new_name = self.rename_buf.strip()
+                            if new_name:
+                                names[s["id"]] = new_name
+                                s["summary"] = new_name
+                                s["has_custom_name"] = True
+                            else:
+                                names.pop(s["id"], None)
+                                s["summary"] = summarize_session(s)
+                                s["has_custom_name"] = False
+                            save_names(names)
+                        self.renaming = False
+                        self.rename_buf = ""
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        self.rename_buf = self.rename_buf[:-1]
+                    elif 32 <= ch <= 126:
+                        self.rename_buf += chr(ch)
+                    continue
+
+                if self.searching:
+                    if ch == 27:  # Esc
+                        self.searching = False
+                        self.search = ""
+                        self.apply_filter()
+                    elif ch in (10, 13):
+                        self.searching = False
+                    elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                        self.search = self.search[:-1]
+                        self.apply_filter()
+                    elif 32 <= ch <= 126:
+                        self.search += chr(ch)
+                        self.apply_filter()
+                    continue
+
+                if ch == ord("q"):
+                    break
+                elif ch == ord("/"):
+                    self.searching = True
+                elif ch == curses.KEY_UP or ch == ord("k"):
+                    self.cursor = max(0, self.cursor - 1)
+                elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    self.cursor = min(len(self.filtered) - 1, self.cursor + 1)
+                elif ch in (10, 13):  # Enter - open session in right pane
+                    if self.filtered:
+                        s = self.filtered[self.cursor]
+                        self.launch_in_pane(s)
+                elif ch == ord("o"):  # Open fullscreen
+                    if self.filtered:
+                        self.launch_fullscreen(self.filtered[self.cursor])
+                elif ch == ord("v"):
+                    if self.filtered:
+                        self.selected_session = self.filtered[self.cursor]
+                        self.detail_scroll = 0
+                        self.mode = "detail"
+                elif ch == ord("c"):
+                    if self.filtered:
+                        self.selected_session = self.filtered[self.cursor]
+                        self.open_conversation()
+                elif ch == ord("r"):
+                    if self.filtered:
+                        s = self.filtered[self.cursor]
+                        self.renaming = True
+                        self.rename_buf = s["summary"] if s.get("has_custom_name") else ""
+                elif ch == ord("n"):
+                    self.launch_new_in_pane()
+                elif ch == ord("g"):
+                    self.cursor = 0
+                elif ch == ord("G"):
+                    self.cursor = max(0, len(self.filtered) - 1)
+                elif ch == 9:  # Tab - focus right pane
+                    subprocess.run(["tmux", "select-pane", "-t", TMUX_RIGHT_PANE], check=False)
+                elif ch == ord("R"):
+                    self.sessions = load_sessions()
+                    self.apply_filter()
+                    self.status_msg = "Reloaded sessions"
+
+            elif self.mode == "detail":
+                self.draw_detail()
+                ch = self.stdscr.getch()
+                if ch in (ord("q"), 27):
+                    self.mode = "list"
+                elif ch in (10, 13):
+                    self.launch_in_pane(self.selected_session)
+                    self.mode = "list"
+                elif ch == ord("o"):
+                    self.launch_fullscreen(self.selected_session)
+                    self.mode = "list"
+                elif ch == curses.KEY_UP or ch == ord("k"):
+                    self.detail_scroll = max(0, self.detail_scroll - 1)
+                elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    self.detail_scroll += 1
+                elif ch == ord("c"):
+                    self.open_conversation()
+                elif ch == ord("g"):
+                    self.detail_scroll = 0
+                elif ch == ord("G"):
+                    self.detail_scroll = 99999
+
+            elif self.mode == "conversation":
+                self.draw_conversation()
+                ch = self.stdscr.getch()
+                if ch in (ord("q"), 27):
+                    self.mode = "detail"
+                elif ch == curses.KEY_UP or ch == ord("k"):
+                    self.conv_scroll = max(0, self.conv_scroll - 1)
+                elif ch == curses.KEY_DOWN or ch == ord("j"):
+                    self.conv_scroll += 1
+                elif ch == curses.KEY_PPAGE:
+                    h, _ = self.stdscr.getmaxyx()
+                    self.conv_scroll = max(0, self.conv_scroll - (h - 4))
+                elif ch == curses.KEY_NPAGE:
+                    h, _ = self.stdscr.getmaxyx()
+                    self.conv_scroll += h - 4
+                elif ch == ord("g"):
+                    self.conv_scroll = 0
+                elif ch == ord("G"):
+                    self.conv_scroll = 99999
+
+
+def main():
+    if not HISTORY_FILE.exists():
+        print("No Claude Code history found at", HISTORY_FILE)
+        sys.exit(1)
+
+    # Non-interactive search
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ("--search", "-s") and len(sys.argv) > 2:
+            query = " ".join(sys.argv[2:]).lower()
+            sessions = load_sessions()
+            matches = [
+                s for s in sessions
+                if query in s["project"].lower()
+                or any(query in p["text"].lower() for p in s["prompts"])
+            ]
+            if not matches:
+                print(f"No sessions matching '{query}'")
+                sys.exit(0)
+            for s in matches:
+                proj = short_project(s["project"])
+                ts = format_ts(s["last_ts"])
+                desc = s.get("summary", "")
+                print(f"\033[36m{ts}\033[0m  \033[32m{proj}\033[0m  ({len(s['prompts'])} prompts)")
+                print(f"    {desc}")
+                print(f"    \033[90mid: {s['id']}\033[0m")
+                print()
+            sys.exit(0)
+
+        if sys.argv[1] in ("--help", "-h"):
+            print("Claude Code Session Manager")
+            print()
+            print("Usage:")
+            print("  claude-sessions              Launch split-view TUI (tmux)")
+            print("  claude-sessions --no-tmux    Launch picker only (no split)")
+            print("  claude-sessions -s <query>   Search sessions")
+            print("  claude-sessions -h           Show help")
+            print()
+            print("TUI Keybindings:")
+            print("  ↑/↓ or j/k    Navigate")
+            print("  Enter          Open session in right pane")
+            print("  n              New claude session in right pane")
+            print("  r              Rename session")
+            print("  v              View session prompts")
+            print("  c              View full conversation")
+            print("  R              Reload session list")
+            print("  /              Search/filter sessions")
+            print("  g/G            Jump to top/bottom")
+            print("  PgUp/PgDn      Scroll conversation")
+            print("  Esc/q          Back / quit")
+            sys.exit(0)
+
+        # Internal: launched by tmux as the left-pane picker
+        if sys.argv[1] == "--picker":
+            curses.wrapper(lambda stdscr: SessionManager(stdscr).run())
+            sys.exit(0)
+
+        if sys.argv[1] == "--no-tmux":
+            curses.wrapper(lambda stdscr: SessionManager(stdscr).run())
+            sys.exit(0)
+
+    # Default: launch tmux split view
+    if not shutil.which("tmux"):
+        print("tmux is required for split view. Install with: brew install tmux")
+        print("Or run with --no-tmux for picker-only mode.")
+        sys.exit(1)
+
+    tmux_launch()
+
+
+if __name__ == "__main__":
+    main()
