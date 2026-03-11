@@ -7,16 +7,13 @@ import sys
 import curses
 import re
 import subprocess
-import shutil
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 NAMES_FILE = CLAUDE_DIR / "session-names.json"
-TMUX_SESSION = "claude-sessions"
-TMUX_RIGHT_PANE = "claude-sessions:0.1"
 
 
 def load_names():
@@ -212,74 +209,6 @@ def strip_ansi(s):
     return re.sub(r"\x1b\[[0-9;]*m", "", s)
 
 
-# ─── tmux helpers ───
-
-def in_tmux():
-    return os.environ.get("TMUX", "") != ""
-
-
-def in_our_tmux():
-    """Check if we're running inside the claude-sessions tmux session."""
-    return os.environ.get("CLAUDE_SESSIONS_PANE") == "1"
-
-
-def tmux_send(pane, cmd):
-    """Send keys to a tmux pane. Interrupts any running process first."""
-    subprocess.run(["tmux", "send-keys", "-t", pane, "C-c", ""], check=False)
-    subprocess.run(["tmux", "send-keys", "-t", pane, cmd, "Enter"], check=False)
-
-
-def tmux_launch():
-    """Create the tmux split layout and launch the TUI in the left pane."""
-    script = os.path.abspath(__file__)
-
-    # Kill existing session if any
-    subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION], check=False,
-                    capture_output=True)
-
-    # Create new session with the picker in the left pane
-    subprocess.run([
-        "tmux", "new-session", "-d",
-        "-s", TMUX_SESSION,
-        "-x", "200", "-y", "50",
-        "-e", "CLAUDE_SESSIONS_PANE=1",
-        f"python3 {script} --picker",
-    ], check=True)
-
-    # Split right pane (60% width)
-    subprocess.run([
-        "tmux", "split-window", "-h",
-        "-t", f"{TMUX_SESSION}:0",
-        "-l", "60%",
-    ], check=True)
-
-    # Send a welcome message to the right pane
-    subprocess.run([
-        "tmux", "send-keys", "-t", TMUX_RIGHT_PANE,
-        "echo '  Select a session from the left pane and press Enter to load it here.'", "Enter",
-    ], check=False)
-
-    # Bind Ctrl-b p to toggle the picker pane
-    # The command breaks/joins pane 0 to hide/show the picker
-    toggle_cmd = (
-        "if [ \"$(tmux list-panes -t claude-sessions:0 | wc -l | tr -d ' ')\" = \"1\" ]; then "
-        "tmux join-pane -hb -t claude-sessions:0 -s claude-sessions:picker -l 40%; "
-        "else "
-        "tmux break-pane -d -t claude-sessions:0.0 -n picker; "
-        "fi"
-    )
-    subprocess.run([
-        "tmux", "bind-key", "-T", "prefix", "p",
-        "run-shell", toggle_cmd,
-    ], check=False)
-
-    # Focus back on the left pane (picker)
-    subprocess.run(["tmux", "select-pane", "-t", f"{TMUX_SESSION}:0.0"], check=False)
-
-    # Attach
-    os.execvp("tmux", ["tmux", "attach-session", "-t", TMUX_SESSION])
-
-
 # ─── TUI with curses ───
 
 class SessionManager:
@@ -315,6 +244,7 @@ class SessionManager:
 
         curses.curs_set(0)
         self.stdscr.keypad(True)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
 
     def apply_filter(self):
         if not self.search:
@@ -330,28 +260,26 @@ class SessionManager:
         self.cursor = 0
         self.scroll = 0
 
-    def launch_in_pane(self, session):
-        """Send claude resume command to the right tmux pane."""
+    def copy_resume_cmd(self, session):
+        """Copy the claude resume command to the clipboard."""
         sid = session["id"]
         project = session["project"]
-        tmux_send(TMUX_RIGHT_PANE, f"cd {project} && claude --resume {sid} --dangerously-skip-permissions")
-        self.status_msg = f"Resumed: {session.get('summary', sid[:8])}"
+        cmd = f"cd {project} && claude --resume {sid} --dangerously-skip-permissions"
+        subprocess.run(["pbcopy"], input=cmd.encode(), check=False)
+        self.status_msg = f"Copied resume command for: {session.get('summary', sid[:8])}"
 
-    def launch_new_in_pane(self):
-        """Send new claude session command to the right tmux pane."""
-        tmux_send(TMUX_RIGHT_PANE, "claude --dangerously-skip-permissions")
-        self.status_msg = "Started new session"
-
-    def launch_fullscreen(self, session):
-        """Open session in a new full tmux window."""
+    def launch_session(self, session):
+        """Exit the TUI and resume the session in the current terminal."""
         sid = session["id"]
         project = session["project"]
-        subprocess.run([
-            "tmux", "new-window", "-t", TMUX_SESSION,
-            "-n", session.get("summary", sid[:8])[:20],
-            f"cd {project} && claude --resume {sid} --dangerously-skip-permissions",
-        ], check=False)
-        self.status_msg = f"Opened fullscreen: {session.get('summary', sid[:8])}"
+        curses.endwin()
+        os.chdir(project)
+        os.execvp("claude", ["claude", "--resume", sid, "--dangerously-skip-permissions"])
+
+    def launch_new_session(self):
+        """Exit the TUI and start a new claude session in the current terminal."""
+        curses.endwin()
+        os.execvp("claude", ["claude", "--dangerously-skip-permissions"])
 
     def draw_list(self):
         h, w = self.stdscr.getmaxyx()
@@ -449,7 +377,7 @@ class SessionManager:
                 self.stdscr.addnstr(y + 2, 1, "─" * (w - 2), w - 2, curses.color_pair(8))
 
         # Footer
-        footer = " Enter open  o fullscreen  n new  r rename  v view  c conv  / search  q quit "
+        footer = " Enter open  n new  r rename  v view  c conv  y copy  / search  q quit "
         self.stdscr.attron(curses.color_pair(1))
         self.stdscr.addnstr(h - 1, 0, "─" * w, w - 1)
         fx = (w - len(footer)) // 2
@@ -498,7 +426,7 @@ class SessionManager:
             self.stdscr.addnstr(y, 6, text, max(0, w - len(ts) - 8), curses.color_pair(5))
             self.stdscr.addnstr(y, w - len(ts) - 2, ts, len(ts), curses.color_pair(3))
 
-        footer = " Enter open  o fullscreen  ↑↓ scroll  c conv  Esc/q back "
+        footer = " Enter open  ↑↓ scroll  c conv  Esc/q back "
         self.stdscr.attron(curses.color_pair(1))
         self.stdscr.addnstr(h - 1, 0, "─" * w, w - 1)
         fx = (w - len(footer)) // 2
@@ -652,13 +580,10 @@ class SessionManager:
                     self.cursor = max(0, self.cursor - 1)
                 elif ch == curses.KEY_DOWN or ch == ord("j"):
                     self.cursor = min(len(self.filtered) - 1, self.cursor + 1)
-                elif ch in (10, 13):  # Enter - open session in right pane
+                elif ch in (10, 13):  # Enter - open session in current terminal
                     if self.filtered:
                         s = self.filtered[self.cursor]
-                        self.launch_in_pane(s)
-                elif ch == ord("o"):  # Open fullscreen
-                    if self.filtered:
-                        self.launch_fullscreen(self.filtered[self.cursor])
+                        self.launch_session(s)
                 elif ch == ord("v"):
                     if self.filtered:
                         self.selected_session = self.filtered[self.cursor]
@@ -673,16 +598,15 @@ class SessionManager:
                         s = self.filtered[self.cursor]
                         self.renaming = True
                         self.rename_buf = s["summary"] if s.get("has_custom_name") else ""
+                elif ch == ord("y"):
+                    if self.filtered:
+                        self.copy_resume_cmd(self.filtered[self.cursor])
                 elif ch == ord("n"):
-                    self.launch_new_in_pane()
+                    self.launch_new_session()
                 elif ch == ord("g"):
                     self.cursor = 0
                 elif ch == ord("G"):
                     self.cursor = max(0, len(self.filtered) - 1)
-                elif ch == 9:  # Tab - focus right pane
-                    subprocess.run(["tmux", "select-pane", "-t", TMUX_RIGHT_PANE], check=False)
-                elif ch == curses.KEY_BTAB:  # Shift+Tab - refocus list pane
-                    subprocess.run(["tmux", "select-pane", "-t", f"{TMUX_SESSION}:0.0"], check=False)
                 elif ch == ord("R"):
                     self.sessions = load_sessions()
                     self.apply_filter()
@@ -694,11 +618,7 @@ class SessionManager:
                 if ch in (ord("q"), 27):
                     self.mode = "list"
                 elif ch in (10, 13):
-                    self.launch_in_pane(self.selected_session)
-                    self.mode = "list"
-                elif ch == ord("o"):
-                    self.launch_fullscreen(self.selected_session)
-                    self.mode = "list"
+                    self.launch_session(self.selected_session)
                 elif ch == curses.KEY_UP or ch == ord("k"):
                     self.detail_scroll = max(0, self.detail_scroll - 1)
                 elif ch == curses.KEY_DOWN or ch == ord("j"):
@@ -763,15 +683,14 @@ def main():
             print("Claude Code Session Manager")
             print()
             print("Usage:")
-            print("  claude-sessions              Launch split-view TUI (tmux)")
-            print("  claude-sessions --no-tmux    Launch picker only (no split)")
+            print("  claude-sessions              Launch TUI session picker")
             print("  claude-sessions -s <query>   Search sessions")
             print("  claude-sessions -h           Show help")
             print()
             print("TUI Keybindings:")
             print("  ↑/↓ or j/k    Navigate")
-            print("  Enter          Open session in right pane")
-            print("  n              New claude session in right pane")
+            print("  Enter          Open session in current terminal")
+            print("  n              New claude session in current terminal")
             print("  r              Rename session")
             print("  v              View session prompts")
             print("  c              View full conversation")
@@ -779,27 +698,10 @@ def main():
             print("  /              Search/filter sessions")
             print("  g/G            Jump to top/bottom")
             print("  PgUp/PgDn      Scroll conversation")
-            print("  Tab            Focus right pane")
-            print("  Shift+Tab      Refocus left (list) pane")
             print("  Esc/q          Back / quit")
             sys.exit(0)
 
-        # Internal: launched by tmux as the left-pane picker
-        if sys.argv[1] == "--picker":
-            curses.wrapper(lambda stdscr: SessionManager(stdscr).run())
-            sys.exit(0)
-
-        if sys.argv[1] == "--no-tmux":
-            curses.wrapper(lambda stdscr: SessionManager(stdscr).run())
-            sys.exit(0)
-
-    # Default: launch tmux split view
-    if not shutil.which("tmux"):
-        print("tmux is required for split view. Install with: brew install tmux")
-        print("Or run with --no-tmux for picker-only mode.")
-        sys.exit(1)
-
-    tmux_launch()
+    curses.wrapper(lambda stdscr: SessionManager(stdscr).run())
 
 
 if __name__ == "__main__":
